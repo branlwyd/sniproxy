@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+// Config represents a config for SNIProxy.
+message Config {
+  message Mapping {
+    // The hostname found in the SNI extension.
+    string host_name = 1;
+    // The network address (e.g. host:port) to proxy traffic to.
+    string destination = 2;
+  }
+  // Mapping represents a mapping of SNI hostname to destination.
+  repeated Mapping mapping = 1;
+}
