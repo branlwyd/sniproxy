@@ -122,20 +122,17 @@ func handleConn(c net.Conn) {
 		}
 	}()
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	defer wg.Wait()
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(srvConn, io.MultiReader(&buf, c)); err != nil { // XXX: multireader w/ buf
+		if _, err := io.Copy(srvConn, io.MultiReader(&buf, c)); err != nil {
 			log.Printf("[%s] Could not proxy from client to %q: %v", c.RemoteAddr(), dest, err)
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(c, srvConn); err != nil {
-			log.Printf("[%s] Could not proxy from %q to client: %v", c.RemoteAddr(), dest, err)
-		}
-	}()
+	if _, err := io.Copy(c, srvConn); err != nil {
+		log.Printf("[%s] Could not proxy from %q to client: %v", c.RemoteAddr(), dest, err)
+	}
 }
 
 const maxRecordSize = 1 << 14
