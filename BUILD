@@ -7,8 +7,8 @@ go_prefix("github.com/BranLwyd/sniproxy")
 ## Binaries
 ##
 go_binary(
-    name = "sniproxy",
-    srcs = ["sniproxy.go"],
+    name = "sniproxyd",
+    srcs = ["sniproxyd.go"],
     pure = "on",
     deps = [
         ":sniproxy_go_proto",
