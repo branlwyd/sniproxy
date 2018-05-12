@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	port   = flag.Int("port", 0, "Port to listen on.")
+	port   = flag.Int("port", 443, "Port to listen on.")
 	config = flag.String("config", "", "Location of config file.")
 
 	// Config data.
@@ -33,9 +33,6 @@ var (
 func main() {
 	// Parse & verify flags.
 	flag.Parse()
-	if *port == 0 {
-		log.Fatalf("--port is required")
-	}
 	if *config == "" {
 		log.Fatalf("--config is required")
 	}
