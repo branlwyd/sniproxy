@@ -14,6 +14,7 @@ go_binary(
         ":sniproxy_go_proto",
         "@com_github_golang_protobuf//proto:go_default_library",
         "@com_github_thomaso-mirodin_intmath//i64:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
     ],
 )
 

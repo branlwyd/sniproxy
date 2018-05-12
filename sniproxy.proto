@@ -10,4 +10,10 @@ message Config {
   }
   // Mapping represents a mapping of SNI hostname to destination.
   repeated Mapping mapping = 1;
+  // The timeout for a new connection to send the SNI extension, in seconds. Defaults to 10s.
+  double initial_timeout_s = 2;
+  // The timeout when dialing a configured destination, in seconds. Defaults to 10s.
+  double dial_timeout_s = 3;
+  // The read/write timeouts when copying data, in seconds. Defaults to 10s.
+  double data_timeout_s = 4;
 }

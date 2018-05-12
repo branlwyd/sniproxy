@@ -15,3 +15,9 @@ go_repository(
     commit = "5dc6d854e46e8db72326367254b8de5d2c5f2f4f",
     importpath = "github.com/thomaso-mirodin/intmath",
 )
+
+go_repository(
+    name = "org_golang_x_sync",
+    commit = "1d60e4601c6fd243af51cc01ddf169918a5407ca",
+    importpath = "golang.org/x/sync",
+)

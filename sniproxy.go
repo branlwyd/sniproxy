@@ -11,9 +11,10 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/golang/protobuf/proto"
+	"golang.org/x/sync/errgroup"
 
 	pb "github.com/BranLwyd/sniproxy/sniproxy_go_proto"
 )
@@ -22,7 +23,11 @@ var (
 	port   = flag.Int("port", 0, "Port to listen on.")
 	config = flag.String("config", "", "Location of config file.")
 
-	mapping = map[string]string{} // SNI hostname -> destination address
+	// Config data.
+	mapping        = map[string]string{} // SNI hostname -> destination address
+	initialTimeout = 5 * time.Second
+	dialTimeout    = 5 * time.Second
+	dataTimeout    = 10 * time.Second
 )
 
 func main() {
@@ -60,6 +65,15 @@ func main() {
 		}
 		mapping[m.HostName] = m.Destination
 	}
+	if cfg.InitialTimeoutS > 0 {
+		initialTimeout = time.Duration(cfg.InitialTimeoutS * float64(time.Second))
+	}
+	if cfg.DialTimeoutS > 0 {
+		dialTimeout = time.Duration(cfg.DialTimeoutS * float64(time.Second))
+	}
+	if cfg.DataTimeoutS > 0 {
+		dataTimeout = time.Duration(cfg.DataTimeoutS * float64(time.Second))
+	}
 
 	// Main loop: accept & handle connections
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
@@ -79,8 +93,8 @@ func main() {
 const contentTypeHandshake = 22
 
 func handleConn(c net.Conn) {
-	// TODO: add timeouts (reading from `c`, dialing `dest`, ...)
 	log.Printf("[%s] Accepted connection", c.RemoteAddr())
+	c.SetDeadline(time.Now().Add(initialTimeout))
 	defer func() {
 		if err := c.Close(); err != nil {
 			log.Printf("[%s] Could not close connection: %v", c.RemoteAddr(), err)
@@ -111,7 +125,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 	log.Printf("[%s] Client sent SNI hostname %q, proxying to %q", c.RemoteAddr(), hostName, dest)
-	srvConn, err := net.Dial("tcp", dest)
+	srvConn, err := net.DialTimeout("tcp", dest, dialTimeout)
 	if err != nil {
 		log.Printf("[%s] Could not dial %q: %v", c.RemoteAddr(), dest, err)
 		return
@@ -121,17 +135,13 @@ func handleConn(c net.Conn) {
 			log.Printf("[%s] Could not close connection to %q: %v", c.RemoteAddr(), dest, err)
 		}
 	}()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	defer wg.Wait()
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(srvConn, io.MultiReader(&buf, c)); err != nil {
-			log.Printf("[%s] Could not proxy from client to %q: %v", c.RemoteAddr(), dest, err)
-		}
-	}()
-	if _, err := io.Copy(c, srvConn); err != nil {
-		log.Printf("[%s] Could not proxy from %q to client: %v", c.RemoteAddr(), dest, err)
+
+	// Begin proxying.
+	var eg errgroup.Group
+	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, buf.Bytes())) })
+	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn)) })
+	if err := eg.Wait(); err != nil {
+		log.Printf("[%s] Could not proxy to %s: %v", c.RemoteAddr(), dest, err)
 	}
 }
 
@@ -279,4 +289,77 @@ func uint24(r io.Reader) (uint32, error) {
 		return 0, err
 	}
 	return uint32(buf[0])<<16 | uint32(buf[1])<<8 | uint32(buf[2]), nil
+}
+
+type readConn struct {
+	io.Reader
+	ResetTimeout func()
+	Close        func() error
+	RemoteAddr   func() net.Addr
+}
+
+func newReadConn(c net.Conn) readConn {
+	return readConn{
+		Reader:       c,
+		ResetTimeout: func() { c.SetReadDeadline(time.Now().Add(dataTimeout)) },
+		Close:        c.Close,
+		RemoteAddr:   c.RemoteAddr,
+	}
+}
+
+func newReadConnWithPrefixedData(c net.Conn, prefixed []byte) readConn {
+	return readConn{
+		Reader:       io.MultiReader(bytes.NewReader(prefixed), c),
+		ResetTimeout: func() { c.SetReadDeadline(time.Now().Add(dataTimeout)) },
+		Close:        c.Close,
+		RemoteAddr:   c.RemoteAddr,
+	}
+}
+
+type writeConn struct {
+	io.Writer
+	ResetTimeout func()
+	Close        func() error
+	RemoteAddr   func() net.Addr
+}
+
+func newWriteConn(c net.Conn) writeConn {
+	return writeConn{
+		Writer:       c,
+		ResetTimeout: func() { c.SetWriteDeadline(time.Now().Add(dataTimeout)) },
+		Close:        c.Close,
+		RemoteAddr:   c.RemoteAddr,
+	}
+}
+
+func proxy(dst writeConn, src readConn) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			src.Close()
+			dst.Close()
+		}
+	}()
+
+	var buf [32 * 1024]byte
+	src.ResetTimeout()
+	dst.ResetTimeout()
+	for {
+		n, rdErr := src.Read(buf[:])
+		if n > 0 {
+			src.ResetTimeout()
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return fmt.Errorf("could not write to %s: %q", dst.RemoteAddr(), err)
+			}
+			dst.ResetTimeout()
+		}
+		if rdErr == io.EOF {
+			if err := dst.Close(); err != nil {
+				return fmt.Errorf("could not close %s: %q", dst.RemoteAddr(), err)
+			}
+			return nil
+		}
+		if rdErr != nil {
+			return fmt.Errorf("error reading from %s: %q", src.RemoteAddr(), rdErr)
+		}
+	}
 }
