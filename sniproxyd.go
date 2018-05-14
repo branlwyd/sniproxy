@@ -93,11 +93,8 @@ func handleConn(c net.Conn) {
 	log.Printf("[%s] Accepted connection", c.RemoteAddr())
 	c.SetDeadline(time.Now().Add(initialTimeout))
 	defer func() {
-		if err := c.Close(); err != nil {
-			log.Printf("[%s] Could not close connection: %v", c.RemoteAddr(), err)
-		} else {
-			log.Printf("[%s] Connection closed", c.RemoteAddr())
-		}
+		c.Close()
+		log.Printf("[%s] Connection closed", c.RemoteAddr())
 	}()
 	var buf bytes.Buffer // stores bytes read while parsing handshake message
 	r := io.TeeReader(c, &buf)
@@ -127,15 +124,11 @@ func handleConn(c net.Conn) {
 		log.Printf("[%s] Could not dial %q: %v", c.RemoteAddr(), dest, err)
 		return
 	}
-	defer func() {
-		if err := srvConn.Close(); err != nil {
-			log.Printf("[%s] Could not close connection to %q: %v", c.RemoteAddr(), dest, err)
-		}
-	}()
+	// No need to defer srvConn.Close() since the proxy calls below will ensure that it is closed.
 
 	// Begin proxying.
 	var eg errgroup.Group
-	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, buf.Bytes())) })
+	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, &buf)) })
 	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn)) })
 	if err := eg.Wait(); err != nil {
 		log.Printf("[%s] Could not proxy to %s: %v", c.RemoteAddr(), dest, err)
@@ -197,7 +190,7 @@ func readSNIHostNameFromHandshakeMessage(r io.Reader) (string, error) {
 	if _, err := io.ReadFull(r, buf[:1]); err != nil {
 		return "", fmt.Errorf("could not read SessionID length: %v", err)
 	}
-	if _, err := io.CopyN(ioutil.Discard, r, int64(buf[1])); err != nil {
+	if _, err := io.CopyN(ioutil.Discard, r, int64(buf[0])); err != nil {
 		return "", fmt.Errorf("could not skip SessionID: %v", err)
 	}
 
@@ -304,9 +297,9 @@ func newReadConn(c net.Conn) readConn {
 	}
 }
 
-func newReadConnWithPrefixedData(c net.Conn, prefixed []byte) readConn {
+func newReadConnWithPrefixedData(c net.Conn, prefix io.Reader) readConn {
 	return readConn{
-		Reader:       io.MultiReader(bytes.NewReader(prefixed), c),
+		Reader:       io.MultiReader(prefix, c),
 		ResetTimeout: func() { c.SetReadDeadline(time.Now().Add(dataTimeout)) },
 		Close:        c.Close,
 		RemoteAddr:   c.RemoteAddr,
@@ -329,12 +322,10 @@ func newWriteConn(c net.Conn) writeConn {
 	}
 }
 
-func proxy(dst writeConn, src readConn) (retErr error) {
+func proxy(dst writeConn, src readConn) error {
 	defer func() {
-		if retErr != nil {
-			src.Close()
-			dst.Close()
-		}
+		src.Close()
+		dst.Close()
 	}()
 
 	var buf [32 * 1024]byte
@@ -350,9 +341,6 @@ func proxy(dst writeConn, src readConn) (retErr error) {
 			dst.ResetTimeout()
 		}
 		if rdErr == io.EOF {
-			if err := dst.Close(); err != nil {
-				return fmt.Errorf("could not close %s: %q", dst.RemoteAddr(), err)
-			}
 			return nil
 		}
 		if rdErr != nil {
