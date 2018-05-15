@@ -25,9 +25,9 @@ var (
 
 	// Config data.
 	mapping        = map[string]string{} // Hostname -> destination address
-	initialTimeout = 5 * time.Second
-	dialTimeout    = 5 * time.Second
-	dataTimeout    = 10 * time.Second
+	initialTimeout = 20 * time.Second    // time allowed to parse headers
+	dialTimeout    = 10 * time.Second    // time allowed to dial server
+	dataTimeout    = 240 * time.Second   // once connection is established, allowed idle time before connection is closed
 )
 
 func main() {
@@ -87,14 +87,14 @@ func acceptHTTPConnections() {
 		if err != nil {
 			log.Fatalf("Could not accept HTTPS connection: %v", err)
 		}
-		go handleHTTPConnection(c)
+		go handleHTTPConnection(c.(*net.TCPConn))
 	}
 }
 
 var hostHeaderPrefix = []byte("Host:")
 
-func handleHTTPConnection(c net.Conn) {
-	log.Printf("[%s] Accepted connection", c.RemoteAddr())
+func handleHTTPConnection(c *net.TCPConn) {
+	log.Printf("[%s] Accepted HTTP connection", c.RemoteAddr())
 	c.SetDeadline(time.Now().Add(initialTimeout))
 	defer func() {
 		c.Close()
@@ -139,8 +139,8 @@ func handleHTTPConnection(c net.Conn) {
 
 	// Begin proxying.
 	var eg errgroup.Group
-	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, &buf)) })
-	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn)) })
+	eg.Go(func() error { return proxy(newWriteConn(srvConn.(*net.TCPConn)), newReadConnWithPrefixedData(c, &buf)) })
+	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn.(*net.TCPConn))) })
 	if err := eg.Wait(); err != nil {
 		log.Printf("[%s] Could not proxy to %s: %v", c.RemoteAddr(), dest, err)
 	}
@@ -157,14 +157,14 @@ func acceptHTTPSConnections() {
 		if err != nil {
 			log.Fatalf("Could not accept HTTPS connection: %v", err)
 		}
-		go handleHTTPSConnection(c)
+		go handleHTTPSConnection(c.(*net.TCPConn))
 	}
 }
 
 const contentTypeHandshake = 22
 
-func handleHTTPSConnection(c net.Conn) {
-	log.Printf("[%s] Accepted connection", c.RemoteAddr())
+func handleHTTPSConnection(c *net.TCPConn) {
+	log.Printf("[%s] Accepted HTTPS connection", c.RemoteAddr())
 	c.SetDeadline(time.Now().Add(initialTimeout))
 	defer func() {
 		c.Close()
@@ -203,8 +203,8 @@ func handleHTTPSConnection(c net.Conn) {
 
 	// Begin proxying.
 	var eg errgroup.Group
-	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, &buf)) })
-	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn)) })
+	eg.Go(func() error { return proxy(newWriteConn(srvConn.(*net.TCPConn)), newReadConnWithPrefixedData(c, &buf)) })
+	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn.(*net.TCPConn))) })
 	if err := eg.Wait(); err != nil {
 		log.Printf("[%s] Could not proxy to %s: %v", c.RemoteAddr(), dest, err)
 	}
@@ -406,20 +406,20 @@ type readConn struct {
 	RemoteAddr   func() net.Addr
 }
 
-func newReadConn(c net.Conn) readConn {
+func newReadConn(c *net.TCPConn) readConn {
 	return readConn{
 		Reader:       c,
 		ResetTimeout: func() { c.SetReadDeadline(time.Now().Add(dataTimeout)) },
-		Close:        c.Close,
+		Close:        c.CloseRead,
 		RemoteAddr:   c.RemoteAddr,
 	}
 }
 
-func newReadConnWithPrefixedData(c net.Conn, prefix io.Reader) readConn {
+func newReadConnWithPrefixedData(c *net.TCPConn, prefix io.Reader) readConn {
 	return readConn{
 		Reader:       io.MultiReader(prefix, c),
 		ResetTimeout: func() { c.SetReadDeadline(time.Now().Add(dataTimeout)) },
-		Close:        c.Close,
+		Close:        c.CloseRead,
 		RemoteAddr:   c.RemoteAddr,
 	}
 }
@@ -431,22 +431,23 @@ type writeConn struct {
 	RemoteAddr   func() net.Addr
 }
 
-func newWriteConn(c net.Conn) writeConn {
+func newWriteConn(c *net.TCPConn) writeConn {
 	return writeConn{
 		Writer:       c,
 		ResetTimeout: func() { c.SetWriteDeadline(time.Now().Add(dataTimeout)) },
-		Close:        c.Close,
+		Close:        c.CloseWrite,
 		RemoteAddr:   c.RemoteAddr,
 	}
 }
 
 func proxy(dst writeConn, src readConn) error {
 	defer func() {
+		// Cleanup only: errchecked close is below.
 		src.Close()
 		dst.Close()
 	}()
 
-	var buf [32 * 1024]byte
+	var buf [4096]byte
 	src.ResetTimeout()
 	dst.ResetTimeout()
 	for {
@@ -454,15 +455,18 @@ func proxy(dst writeConn, src readConn) error {
 		if n > 0 {
 			src.ResetTimeout()
 			if _, err := dst.Write(buf[:n]); err != nil {
-				return fmt.Errorf("could not write to %s: %q", dst.RemoteAddr(), err)
+				return fmt.Errorf("could not write to %q: %v", dst.RemoteAddr(), err)
 			}
 			dst.ResetTimeout()
 		}
 		if rdErr == io.EOF {
+			if err := dst.Close(); err != nil {
+				return fmt.Errorf("could not close %q: %v", dst.RemoteAddr(), err)
+			}
 			return nil
 		}
 		if rdErr != nil {
-			return fmt.Errorf("error reading from %s: %q", src.RemoteAddr(), rdErr)
+			return fmt.Errorf("error reading from %q: %v", src.RemoteAddr(), rdErr)
 		}
 	}
 }
