@@ -161,8 +161,6 @@ func acceptHTTPSConnections() {
 	}
 }
 
-const contentTypeHandshake = 22
-
 func handleHTTPSConnection(c *net.TCPConn) {
 	log.Printf("[%s] Accepted HTTPS connection", c.RemoteAddr())
 	c.SetDeadline(time.Now().Add(initialTimeout))
@@ -171,18 +169,9 @@ func handleHTTPSConnection(c *net.TCPConn) {
 		log.Printf("[%s] Connection closed", c.RemoteAddr())
 	}()
 	var buf bytes.Buffer // stores bytes read while parsing handshake message
-	r := bufio.NewReader(io.TeeReader(c, &buf))
-	rec, err := readRecordHeader(r) // TODO: do not assume ClientHello fits in a single record
-	if err != nil {
-		log.Printf("[%s] Could not read handshake record: %v", c.RemoteAddr(), err)
-		return
-	}
-	if rec.contentType != contentTypeHandshake {
-		log.Printf("[%s] Did not receive handshake record", c.RemoteAddr())
-		return
-	}
+	r := &handshakeRecordReader{r: bufio.NewReader(io.TeeReader(c, &buf))}
 
-	hostName, err := readSNIHostNameFromHandshakeMessage(io.LimitReader(r, int64(rec.dataLength)))
+	hostName, err := readSNIHostNameFromHandshakeMessage(r)
 	if err != nil {
 		log.Printf("[%s] Could not get SNI hostname from ClientHello: %v", c.RemoteAddr(), err)
 		return
@@ -210,30 +199,60 @@ func handleHTTPSConnection(c *net.TCPConn) {
 	}
 }
 
-const maxRecordSize = 1 << 14
-
-type recordHeader struct {
-	contentType  byte
-	majorVersion byte
-	minorVersion byte
-	dataLength   uint16
+type handshakeRecordReader struct {
+	r     io.Reader
+	rLen  int
+	rdErr error
 }
 
-func readRecordHeader(r io.Reader) (recordHeader, error) {
-	var hdr [5]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return recordHeader{}, fmt.Errorf("could not read header: %v", err)
+func (r *handshakeRecordReader) Read(p []byte) (n int, retErr error) {
+	defer func() {
+		if retErr != nil {
+			r.rdErr = retErr
+		}
+	}()
+	if r.rdErr != nil {
+		return 0, r.rdErr
 	}
-	dl := binary.BigEndian.Uint16(hdr[3:5])
-	if dl > maxRecordSize {
-		return recordHeader{}, fmt.Errorf("record too large: %d > %d", dl, maxRecordSize)
+
+	// If we've reached the end of a record, read the header for the next record.
+	if r.rLen == 0 {
+		// Read record header.
+
+		// Content type.
+		typ, err := readUint8(r.r)
+		if err != nil {
+			return 0, fmt.Errorf("could not read record header: %v", err)
+		}
+		const contentTypeHandshake = 22
+		if typ != contentTypeHandshake {
+			return 0, fmt.Errorf("got wrong content type (wanted %d, got %d)", contentTypeHandshake, typ)
+		}
+
+		// Skip major & minor version.
+		if err := skip(r.r, 2); err != nil {
+			return 0, fmt.Errorf("could not read record header: %v", err)
+		}
+
+		// Read record data length.
+		sz, err := readUint16(r.r)
+		if err != nil {
+			return 0, fmt.Errorf("could not read record header: %v", err)
+		}
+		const maxRecordSize = 1 << 14
+		if sz > maxRecordSize {
+			return 0, fmt.Errorf("record too large (%d > %d)", sz, maxRecordSize)
+		}
+		r.rLen = int(sz)
 	}
-	return recordHeader{
-		contentType:  hdr[0],
-		majorVersion: hdr[1],
-		minorVersion: hdr[2],
-		dataLength:   dl,
-	}, nil
+
+	// Read up to the remainder of the current record into the provided buffer.
+	if len(p) > r.rLen {
+		p = p[:r.rLen]
+	}
+	n, err := r.r.Read(p)
+	r.rLen -= n
+	return n, err
 }
 
 const handshakeTypeClientHello = 1
