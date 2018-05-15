@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -20,11 +21,10 @@ import (
 )
 
 var (
-	port   = flag.Int("port", 443, "Port to listen on.")
 	config = flag.String("config", "", "Location of config file.")
 
 	// Config data.
-	mapping        = map[string]string{} // SNI hostname -> destination address
+	mapping        = map[string]string{} // Hostname -> destination address
 	initialTimeout = 5 * time.Second
 	dialTimeout    = 5 * time.Second
 	dataTimeout    = 10 * time.Second
@@ -53,7 +53,6 @@ func main() {
 		if m.HostName == "" {
 			log.Fatalf("Mapping at index %d has no hostname", i)
 		}
-		// TODO: append ":https" to destinations without a port specified
 		if m.Destination == "" {
 			log.Fatalf("Mapping for hostname %q has no destination", m.HostName)
 		}
@@ -73,23 +72,99 @@ func main() {
 	}
 
 	// Main loop: accept & handle connections
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	go acceptHTTPConnections()
+	acceptHTTPSConnections()
+}
+
+func acceptHTTPConnections() {
+	l, err := net.Listen("tcp", ":http")
 	if err != nil {
-		log.Fatalf("Could not listen on port %d: %v", *port, err)
+		log.Fatalf("Could not listen for HTTP connections: %v", err)
 	}
-	log.Printf("Accepting connections on port %d", *port)
+	log.Printf("Accepting HTTP connections")
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			log.Fatalf("Could not accept connection: %v", err)
+			log.Fatalf("Could not accept HTTPS connection: %v", err)
 		}
-		go handleConn(c)
+		go handleHTTPConnection(c)
+	}
+}
+
+var hostHeaderPrefix = []byte("Host:")
+
+func handleHTTPConnection(c net.Conn) {
+	log.Printf("[%s] Accepted connection", c.RemoteAddr())
+	c.SetDeadline(time.Now().Add(initialTimeout))
+	defer func() {
+		c.Close()
+		log.Printf("[%s] Connection closed", c.RemoteAddr())
+	}()
+	var buf bytes.Buffer // stores bytes read while parsing headers
+	r := io.TeeReader(c, &buf)
+	s := bufio.NewScanner(r)
+	s.Scan() // skip request line
+	var found bool
+	var hostName string
+	for s.Scan() {
+		ln := s.Bytes()
+		if len(ln) == 0 {
+			break
+		}
+		if bytes.HasPrefix(ln, hostHeaderPrefix) {
+			found, hostName = true, string(bytes.TrimSpace(bytes.TrimPrefix(ln, hostHeaderPrefix)))
+			break
+		}
+	}
+	if err := s.Err(); err != nil {
+		log.Printf("[%s] Error reading request: %v", c.RemoteAddr(), err)
+		return
+	}
+	if !found {
+		log.Printf("[%s] No host header.", c.RemoteAddr())
+		return
+	}
+	dest := mapping[hostName]
+	if dest == "" {
+		log.Printf("[%s] Client sent unknown hostname in Host header: %q", c.RemoteAddr(), hostName)
+		return
+	}
+	log.Printf("[%s] Client sent hostname %q in Host header, proxying to %q", c.RemoteAddr(), hostName, dest)
+	dest = net.JoinHostPort(dest, "http")
+	srvConn, err := net.DialTimeout("tcp", dest, dialTimeout)
+	if err != nil {
+		log.Printf("[%s] Could not dial %q: %v", c.RemoteAddr(), dest, err)
+		return
+	}
+	// No need to defer srvConn.Close() since the proxy calls below will ensure that it is closed.
+
+	// Begin proxying.
+	var eg errgroup.Group
+	eg.Go(func() error { return proxy(newWriteConn(srvConn), newReadConnWithPrefixedData(c, &buf)) })
+	eg.Go(func() error { return proxy(newWriteConn(c), newReadConn(srvConn)) })
+	if err := eg.Wait(); err != nil {
+		log.Printf("[%s] Could not proxy to %s: %v", c.RemoteAddr(), dest, err)
+	}
+}
+
+func acceptHTTPSConnections() {
+	l, err := net.Listen("tcp", ":https")
+	if err != nil {
+		log.Fatalf("Could not listen for HTTPS connections: %v", err)
+	}
+	log.Printf("Accepting HTTPS connections")
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			log.Fatalf("Could not accept HTTPS connection: %v", err)
+		}
+		go handleHTTPSConnection(c)
 	}
 }
 
 const contentTypeHandshake = 22
 
-func handleConn(c net.Conn) {
+func handleHTTPSConnection(c net.Conn) {
 	log.Printf("[%s] Accepted connection", c.RemoteAddr())
 	c.SetDeadline(time.Now().Add(initialTimeout))
 	defer func() {
@@ -119,6 +194,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 	log.Printf("[%s] Client sent SNI hostname %q, proxying to %q", c.RemoteAddr(), hostName, dest)
+	dest = net.JoinHostPort(dest, "https")
 	srvConn, err := net.DialTimeout("tcp", dest, dialTimeout)
 	if err != nil {
 		log.Printf("[%s] Could not dial %q: %v", c.RemoteAddr(), dest, err)
