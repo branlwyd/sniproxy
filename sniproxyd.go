@@ -101,8 +101,7 @@ func handleHTTPConnection(c net.Conn) {
 		log.Printf("[%s] Connection closed", c.RemoteAddr())
 	}()
 	var buf bytes.Buffer // stores bytes read while parsing headers
-	r := io.TeeReader(c, &buf)
-	s := bufio.NewScanner(r)
+	s := bufio.NewScanner(io.TeeReader(c, &buf))
 	s.Scan() // skip request line
 	var found bool
 	var hostName string
@@ -121,7 +120,7 @@ func handleHTTPConnection(c net.Conn) {
 		return
 	}
 	if !found {
-		log.Printf("[%s] No host header.", c.RemoteAddr())
+		log.Printf("[%s] No host header", c.RemoteAddr())
 		return
 	}
 	dest := mapping[hostName]
@@ -172,7 +171,7 @@ func handleHTTPSConnection(c net.Conn) {
 		log.Printf("[%s] Connection closed", c.RemoteAddr())
 	}()
 	var buf bytes.Buffer // stores bytes read while parsing handshake message
-	r := io.TeeReader(c, &buf)
+	r := bufio.NewReader(io.TeeReader(c, &buf))
 	rec, err := readRecordHeader(r) // TODO: do not assume ClientHello fits in a single record
 	if err != nil {
 		log.Printf("[%s] Could not read handshake record: %v", c.RemoteAddr(), err)
@@ -240,107 +239,106 @@ func readRecordHeader(r io.Reader) (recordHeader, error) {
 const handshakeTypeClientHello = 1
 
 func readSNIHostNameFromHandshakeMessage(r io.Reader) (string, error) {
-	var buf [4]byte
-
 	// Handshake message type.
-	if _, err := io.ReadFull(r, buf[:1]); err != nil {
-		return "", fmt.Errorf("could not read handshake message type: %v", err)
+	hTyp, err := readUint8(r)
+	if err != nil {
+		return "", fmt.Errorf("could not read msg_type: %v", err)
 	}
-	if buf[0] != handshakeTypeClientHello {
-		return "", fmt.Errorf("handshake message not a ClientHello (type %d, expected %d)", buf[0], handshakeTypeClientHello)
+	if hTyp != handshakeTypeClientHello {
+		return "", fmt.Errorf("handshake message not a ClientHello (type %d, expected %d)", hTyp, handshakeTypeClientHello)
 	}
 
 	// Handshake message length.
-	hl, err := uint24(r)
+	hLen, err := readUint24(r)
 	if err != nil {
 		return "", fmt.Errorf("could not read handshake message length: %v", err)
 	}
-	r = io.LimitReader(r, int64(hl))
+	r = io.LimitReader(r, int64(hLen))
 
-	// ProtocolVersion & Random
-	if _, err := io.CopyN(ioutil.Discard, r, 34); err != nil {
-		return "", fmt.Errorf("could not skip ProtocolVersion & Random: %v", err)
+	// ProtocolVersion (2 bytes) & Random (32 bytes)
+	if err := skip(r, 34); err != nil {
+		return "", fmt.Errorf("could not skip client_version & random: %v", err)
 	}
 
 	// Session ID.
-	if _, err := io.ReadFull(r, buf[:1]); err != nil {
-		return "", fmt.Errorf("could not read SessionID length: %v", err)
-	}
-	if _, err := io.CopyN(ioutil.Discard, r, int64(buf[0])); err != nil {
-		return "", fmt.Errorf("could not skip SessionID: %v", err)
+	if err := skipVec8(r); err != nil {
+		return "", fmt.Errorf("could not skip session_id: %v", err)
 	}
 
 	// Cipher suites.
-	if _, err := io.ReadFull(r, buf[:2]); err != nil {
-		return "", fmt.Errorf("could not read CipherSuite length: %v", err)
-	}
-	if _, err := io.CopyN(ioutil.Discard, r, int64(binary.BigEndian.Uint16(buf[:2]))); err != nil {
-		return "", fmt.Errorf("could not skip CipherSuite: %v", err)
+	if err := skipVec16(r); err != nil {
+		return "", fmt.Errorf("could not skip cipher_suites: %v", err)
 	}
 
 	// Compression methods.
-	if _, err := io.ReadFull(r, buf[:1]); err != nil {
-		return "", fmt.Errorf("could not read CompressionMethod length: %v", err)
-	}
-	if _, err := io.CopyN(ioutil.Discard, r, int64(buf[0])); err != nil {
-		return "", fmt.Errorf("could not skip CompressionMethod: %v", err)
+	if err := skipVec8(r); err != nil {
+		return "", fmt.Errorf("could not skip compression_methods: %v", err)
 	}
 
 	// Extensions.
-	_, err = io.ReadFull(r, buf[:2])
+	eLen, err := readUint16(r)
 	if err == io.EOF {
 		return "", errors.New("no extensions")
 	}
 	if err != nil {
-		return "", fmt.Errorf("could not read Extensions length: %v", err)
+		return "", fmt.Errorf("could not read extensions length: %v", err)
 	}
-	r = io.LimitReader(r, int64(binary.BigEndian.Uint16(buf[:2])))
+	r = io.LimitReader(r, int64(eLen))
 	for {
-		_, err := io.ReadFull(r, buf[:4])
+		eTyp, err := readUint16(r)
 		if err == io.EOF {
 			return "", errors.New("no SNI extension")
 		}
 		if err != nil {
-			return "", fmt.Errorf("could not read Extension type & length: %v", err)
+			return "", fmt.Errorf("could not read extension_type: %v", err)
 		}
-		typ, l := binary.BigEndian.Uint16(buf[0:2]), binary.BigEndian.Uint16(buf[2:4])
+		eLen, err := readUint16(r)
+		if err != nil {
+			return "", fmt.Errorf("could not read extension_data length: %v", err)
+		}
 
 		const extensionTypeSNI = 0
-		if typ != extensionTypeSNI {
+		if eTyp != extensionTypeSNI {
 			// This is not an SNI extension; skip it.
-			if _, err := io.CopyN(ioutil.Discard, r, int64(l)); err != nil {
-				return "", fmt.Errorf("could not skip extension: %v", err)
+			if err := skip(r, int64(eLen)); err != nil {
+				return "", fmt.Errorf("could not skip extension_data: %v", err)
 			}
 			continue
 		}
-		extR := io.LimitReader(r, int64(l))
+		extR := io.LimitReader(r, int64(eLen))
 
 		// ServerNameList length.
-		if _, err := io.ReadFull(extR, buf[:2]); err != nil {
-			return "", fmt.Errorf("could not read ServerNameList length: %v", err)
+		snlLen, err := readUint16(extR)
+		if err != nil {
+			return "", fmt.Errorf("could not read server_name_list length: %v", err)
 		}
-		extR = io.LimitReader(r, int64(binary.BigEndian.Uint16(buf[:2])))
+		extR = io.LimitReader(r, int64(snlLen))
 		for {
 			// NameType & length.
-			_, err := io.ReadFull(extR, buf[:3])
+			nTyp, err := readUint8(extR)
 			if err == io.EOF {
-				return "", errors.New("SNI extension has no host_name NameType")
+				return "", errors.New("SNI extension has no ServerName of type host_name")
 			}
 			if err != nil {
-				return "", fmt.Errorf("could not read NameType & length: %v", err)
+				return "", fmt.Errorf("could not read name_type: %v", err)
 			}
-			typ, l := buf[0], binary.BigEndian.Uint16(buf[1:3])
 
 			const nameTypeHostName = 0
-			if typ != nameTypeHostName {
+			if nTyp != nameTypeHostName {
 				// This is not a host_name-typed ServerName. Skip this ServerName.
-				if _, err := io.CopyN(ioutil.Discard, extR, int64(l)); err != nil {
-					return "", fmt.Errorf("could not skip ServerName: %v", err)
+				if err := skipVec16(r); err != nil {
+					return "", fmt.Errorf("could not skip server_name_list entry: %v", err)
 				}
+				continue
 			}
 
+			// This is a host_name-typed ServerName. Read the hostname and return it.
+			nLen, err := readUint16(extR)
+			if err != nil {
+				return "", fmt.Errorf("could not read host_name length: %v", err)
+			}
 			var b strings.Builder
-			if _, err := io.CopyN(&b, extR, int64(l)); err != nil {
+			if _, err := io.CopyN(&b, extR, int64(nLen)); err != nil {
 				return "", fmt.Errorf("could not read HostName: %v", err)
 			}
 			return b.String(), nil
@@ -348,13 +346,57 @@ func readSNIHostNameFromHandshakeMessage(r io.Reader) (string, error) {
 	}
 }
 
-// uint24 interprets data as big-endian
-func uint24(r io.Reader) (uint32, error) {
+func readUint8(r io.Reader) (uint8, error) {
+	var buf [1]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return buf[0], nil
+}
+
+// readUint16 interprets data as big-endian.
+func readUint16(r io.Reader) (uint16, error) {
+	var buf [2]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(buf[:]), nil
+}
+
+// readUint24 interprets data as big-endian.
+func readUint24(r io.Reader) (uint32, error) {
 	var buf [3]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return 0, err
 	}
 	return uint32(buf[0])<<16 | uint32(buf[1])<<8 | uint32(buf[2]), nil
+}
+
+func skip(r io.Reader, sz int64) error {
+	_, err := io.CopyN(ioutil.Discard, r, sz)
+	return err
+}
+
+func skipVec8(r io.Reader) error {
+	vl, err := readUint8(r)
+	if err != nil {
+		return fmt.Errorf("could not read length: %v", err)
+	}
+	if err := skip(r, int64(vl)); err != nil {
+		return fmt.Errorf("could not skip content: %v", err)
+	}
+	return nil
+}
+
+func skipVec16(r io.Reader) error {
+	vl, err := readUint16(r)
+	if err != nil {
+		return fmt.Errorf("could not read length: %v", err)
+	}
+	if err := skip(r, int64(vl)); err != nil {
+		return fmt.Errorf("could not skip content: %v", err)
+	}
+	return nil
 }
 
 type readConn struct {
